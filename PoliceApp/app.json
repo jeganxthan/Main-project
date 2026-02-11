@@ -12,15 +12,20 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-    "ios": {
-      "supportsTablet": true
-    },
     "android": {
+      "usesCleartextTraffic": true,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSAllowsArbitraryLoads": true,
+        "NSAllowsLocalNetworking": true
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
