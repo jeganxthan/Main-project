@@ -7,15 +7,27 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { Audio } from 'expo-av';
 
-const SERVER_BASE = 'http://192.168.1.38:5000';
-const SERVER_URL = `${SERVER_BASE}/run-ai`;
-const RESET_URL = `${SERVER_BASE}/reset-alert`;
+const normalizeBaseUrl = (url) => url.replace(/\/+$/, '');
+const parseCsv = (value) => value.split(',').map((v) => v.trim()).filter(Boolean);
+const DEFAULT_SERVER_BASES = [
+  'http://192.168.1.116:5000',
+  'http://172.16.11.247:5000',
+  'http://192.168.1.39:5000',
+  'http://10.0.2.2:5000',
+  'http://localhost:5000',
+];
+const ENV_SERVER_BASE = (process.env.EXPO_PUBLIC_SERVER_BASE || '').trim();
+const SERVER_CANDIDATES = [
+  ...(ENV_SERVER_BASE ? [normalizeBaseUrl(ENV_SERVER_BASE)] : []),
+  ...parseCsv(process.env.EXPO_PUBLIC_SERVER_BASES || '').map(normalizeBaseUrl),
+  ...DEFAULT_SERVER_BASES,
+].filter((value, index, arr) => arr.indexOf(value) === index);
 
 // Live camera source (direct camera web UI/stream)
 // NOTE: https with a self-signed cert will fail in WebView (SSL not trusted).
 // Use http or install a trusted certificate on the camera.
-const CAMERA_BASE = 'http://192.168.1.39';
-const CAMERA_STREAM_URL = `${CAMERA_BASE}/`;
+const CAMERA_BASE = process.env.EXPO_PUBLIC_CAMERA_BASE || 'http://192.168.1.217';
+const CAMERA_STREAM_URL = `${CAMERA_BASE}:4747/video`;
 
 // Toggle to use camera directly vs Flask proxy
 const DEFAULT_USE_DIRECT_CAMERA = false;
@@ -33,35 +45,39 @@ export default function App() {
   const [downloading, setDownloading] = useState(false);
   const [useDirectCamera, setUseDirectCamera] = useState(DEFAULT_USE_DIRECT_CAMERA);
   const [liveLoading, setLiveLoading] = useState(false);
+  const [serverBase, setServerBase] = useState(SERVER_CANDIDATES[0]);
+  const [serverStatus, setServerStatus] = useState('CONNECTING');
 
   const [sirenSound, setSirenSound] = useState(null);
   const pollInterval = useRef(null);
-  const liveStreamUrl = useDirectCamera ? CAMERA_STREAM_URL : `${SERVER_BASE}/video_feed`;
+  const serverIndexRef = useRef(0);
+  const serverBaseRef = useRef(SERVER_CANDIDATES[0]);
+  const sirenSoundRef = useRef(null);
+  const resultRef = useRef(result);
+  const alertModeRef = useRef(alertMode);
+  const liveStreamUrl = useDirectCamera ? CAMERA_STREAM_URL : `${serverBase}/video_feed`;
+  const resetUrl = `${serverBase}/reset-alert`;
   const liveLoadingTimer = useRef(null);
 
-  // Video Player for Clips
-  const videoUri = result && result.video_url ? `${SERVER_BASE}${result.video_url}` : null;
-  const videoSource = videoUri ? { uri: videoUri } : null;
-  const player = useVideoPlayer(null, (player) => {
-    player.loop = true;
-  });
+  // Move player initialization into a separate component to avoid Activity issues
 
   useEffect(() => {
-    let cancelled = false;
-    const loadVideo = async () => {
-      if (!videoSource) return;
-      try {
-        await player.replaceAsync(videoSource);
-        if (!cancelled) player.play();
-      } catch (e) {
-        console.error('Video load error:', e);
-      }
-    };
-    loadVideo();
-    return () => {
-      cancelled = true;
-    };
-  }, [videoUri, player]);
+    resultRef.current = result;
+  }, [result]);
+
+  useEffect(() => {
+    alertModeRef.current = alertMode;
+  }, [alertMode]);
+
+  useEffect(() => {
+    serverBaseRef.current = serverBase;
+  }, [serverBase]);
+
+  useEffect(() => {
+    sirenSoundRef.current = sirenSound;
+  }, [sirenSound]);
+
+  // Removed global video useEffect (moved to ClipsPlayer)
 
   useEffect(() => {
     startPolling();
@@ -90,8 +106,8 @@ export default function App() {
     }
     loadSound();
     return () => {
-      if (sirenSound) {
-        sirenSound.unloadAsync();
+      if (sirenSoundRef.current) {
+        sirenSoundRef.current.unloadAsync();
       }
     };
   }, []);
@@ -105,7 +121,10 @@ export default function App() {
 
   const startPolling = () => {
     if (pollInterval.current) return;
-    pollInterval.current = setInterval(runDetection, 3000);
+    runDetection();
+    pollInterval.current = setInterval(() => {
+      runDetection();
+    }, 3000);
   };
 
   const stopPolling = () => {
@@ -117,9 +136,12 @@ export default function App() {
 
   const stopSiren = async () => {
     try {
-      if (sirenSound) {
-        await sirenSound.stopAsync();
-        await sirenSound.setPositionAsync(0);
+      if (sirenSoundRef.current) {
+        const status = await sirenSoundRef.current.getStatusAsync();
+        if (status.isLoaded) {
+          await sirenSoundRef.current.stopAsync();
+          await sirenSoundRef.current.setPositionAsync(0);
+        }
       }
     } catch (e) {
       console.error('Siren stop error:', e);
@@ -128,9 +150,12 @@ export default function App() {
 
   async function playSiren() {
     try {
-      if (sirenSound) {
-        await sirenSound.setIsLoopingAsync(true);
-        await sirenSound.playAsync();
+      if (sirenSoundRef.current) {
+        const status = await sirenSoundRef.current.getStatusAsync();
+        if (status.isLoaded) {
+          await sirenSoundRef.current.setIsLoopingAsync(true);
+          await sirenSoundRef.current.playAsync();
+        }
       }
     } catch (error) {
       console.error('Siren play error:', error);
@@ -141,24 +166,37 @@ export default function App() {
     stopSiren();
     setAlertMode(false);
     try {
-      await fetch(RESET_URL);
+      await fetch(resetUrl);
     } catch (e) {
       console.error('Reset alert error:', e);
     }
   }
 
+  const rotateServerBase = () => {
+    if (SERVER_CANDIDATES.length <= 1) return;
+    serverIndexRef.current = (serverIndexRef.current + 1) % SERVER_CANDIDATES.length;
+    const nextBase = SERVER_CANDIDATES[serverIndexRef.current];
+    serverBaseRef.current = nextBase;
+    setServerBase(nextBase);
+    setServerStatus(`RETRYING (${nextBase})`);
+    console.warn(`Switching backend to ${nextBase}`);
+  };
+
   const runDetection = async () => {
     try {
-      const response = await fetch(SERVER_URL);
+      const activeBase = serverBaseRef.current;
+      const response = await fetch(`${activeBase}/run-ai`);
+      if (!response.ok) throw new Error(`Backend HTTP ${response.status}`);
       const data = await response.json();
+      setServerStatus('ONLINE');
 
       if (data.fight) {
         setResult(data);
-        if (!result || data.timestamp !== result.timestamp) {
+        if (!resultRef.current || data.timestamp !== resultRef.current.timestamp) {
           if (data.image_urls) {
-            setImageUrls(data.image_urls.map(url => `${SERVER_BASE}${url}?t=${Date.now()}`));
+            setImageUrls(data.image_urls.map(url => `${activeBase}${url}?t=${Date.now()}`));
           }
-          if (!alertMode) {
+          if (!alertModeRef.current) {
             setAlertMode(true);
             await playSiren();
             setActiveTab('alerts');
@@ -167,6 +205,8 @@ export default function App() {
       }
     } catch (error) {
       console.error('Polling Error:', error);
+      setServerStatus('OFFLINE');
+      rotateServerBase();
     }
   };
 
@@ -211,6 +251,9 @@ export default function App() {
         <Text style={styles.liveSourceLabel}>
           {useDirectCamera ? 'SOURCE: CAMERA' : 'SOURCE: SERVER'}
         </Text>
+        {!useDirectCamera && (
+          <Text style={styles.liveStatusLabel}>{serverStatus}</Text>
+        )}
         <TouchableOpacity
           style={styles.sourceButton}
           onPress={() => setUseDirectCamera((prev) => !prev)}
@@ -306,26 +349,15 @@ export default function App() {
           )}
         </View>
       ) : (
-        <View style={styles.videoCard}>
-          <VideoView
-            player={player}
-            style={styles.videoPlayer}
-            nativeControls
-            contentFit="contain"
-            allowsFullscreen
-            allowsPictureInPicture
-          />
-          <TouchableOpacity
-            style={styles.downloadButton}
-            onPress={() => downloadFile(`${SERVER_BASE}${result.video_url}`)}
-            disabled={downloading}
-          >
-            <Text style={styles.buttonText}>{downloading ? 'SAVING...' : 'DOWNLOAD FIGHT CLIP'}</Text>
-          </TouchableOpacity>
-        </View>
+        <ClipsPlayer 
+          videoUri={`${serverBase}${result.video_url}`} 
+          onDownload={() => downloadFile(`${serverBase}${result.video_url}`)}
+          downloading={downloading}
+        />
       )}
     </View>
   );
+
 
   return (
     <View style={[styles.container, alertMode && styles.alertBackground]}>
@@ -345,13 +377,45 @@ export default function App() {
   );
 }
 
+function ClipsPlayer({ videoUri, onDownload, downloading }) {
+  const player = useVideoPlayer(videoUri, (player) => {
+    player.loop = true;
+    player.play();
+  });
+
+  useEffect(() => {
+    player.replaceAsync({ uri: videoUri });
+    player.play();
+  }, [videoUri, player]);
+
+  return (
+    <View style={styles.videoCard}>
+      <VideoView
+        player={player}
+        style={styles.videoPlayer}
+        nativeControls
+        contentFit="contain"
+        allowsFullscreen
+        allowsPictureInPicture
+      />
+      <TouchableOpacity
+        style={styles.downloadButton}
+        onPress={onDownload}
+        disabled={downloading}
+      >
+        <Text style={styles.buttonText}>{downloading ? 'SAVING...' : 'DOWNLOAD FIGHT CLIP'}</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
   alertBackground: { backgroundColor: '#400' },
   header: { paddingTop: 60, paddingBottom: 20, alignItems: 'center' },
   title: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
   tabBar: { flexDirection: 'row', height: 50, borderBottomWidth: 1, borderColor: '#333' },
-  tabButton: { flex: 1, justifyCenter: 'center', alignItems: 'center' },
+  tabButton: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   activeTab: { borderBottomWidth: 3, borderColor: '#0055ff' },
   tabText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
   main: { flex: 1 },
@@ -367,12 +431,13 @@ const styles = StyleSheet.create({
   },
   liveToolbar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
   liveSourceLabel: { color: '#888', fontSize: 10, fontWeight: 'bold' },
+  liveStatusLabel: { color: '#0af', fontSize: 10, fontWeight: 'bold' },
   sourceButton: { backgroundColor: '#222', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6 },
   sourceButtonText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
   liveBadge: { position: 'absolute', top: 10, left: 10, backgroundColor: 'rgba(255,0,0,0.7)', padding: 5, borderRadius: 3 },
   redDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#fff' },
   liveText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
-  emptyAlerts: { flex: 1, justifyCenter: 'center', alignItems: 'center' },
+  emptyAlerts: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   statusText: { color: '#666' },
   alertsScroll: { flex: 1 },
   alertText: { color: '#f44', fontSize: 16, fontWeight: 'bold', textAlign: 'center', marginBottom: 10 },
